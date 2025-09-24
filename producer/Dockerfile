@@ -5,13 +5,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY openmeteo_producer.py /app/openmeteo_producer.py
 
-RUN useradd -m appuser
-USER appuser
-
-# CITIES_FILE=/app/conf/cities.json monté par volume
-CMD ["python","openmeteo_producer.py"]
+# Conf is mounted at runtime
+CMD ["python", "/app/openmeteo_producer.py"]

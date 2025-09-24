@@ -101,6 +101,8 @@ services:
     ports:
       - "8080:8080"   # Spark Master UI
       - "7077:7077"   # Spark Master RPC
+    volumes:
+      - ./spark:/opt/spark_jobs
     networks: [lambda-net]
 
   spark-worker-1:
@@ -114,6 +116,8 @@ services:
       - HADOOP_USER_NAME=root
       - USER=root
     depends_on: [spark-master]
+    volumes:
+      - ./spark:/opt/spark_jobs
     networks: [lambda-net]
 
   # ---------- Airflow (mix "officiel" + stack globale) ----------
@@ -268,6 +272,7 @@ services:
       - TOPIC_Q_RES=${TOPIC_Q_RES:-weather.queries.results}
     volumes:
       - ./conf:/app/conf
+      - ./backend:/app
     depends_on: [kafka]
     ports:
       - "8000:8000"
@@ -294,8 +299,31 @@ services:
     image: openmeteo-streamlit:latest
     <<: *env
     depends_on: [backend]
+    environment:
+      - BACKEND_URL=http://backend:8000
     ports:
       - "8501:8501"
+    networks: [lambda-net]
+
+  query-runner:
+    build: ./query_runner
+    image: openmeteo-query-runner:latest
+    <<: *env
+    environment:
+      - KAFKA_BROKER=${KAFKA_BROKER:-kafka:9092}
+      - TOPIC_Q_REQ=${TOPIC_Q_REQ:-weather.queries.requests}
+      - TOPIC_Q_RES=${TOPIC_Q_RES:-weather.queries.results}
+      - SPARK_MASTER=spark://spark-master:7077
+      - HDFS_BASE=hdfs://namenode:8020/datalake
+      - SPARK_SCRIPT=/opt/spark_jobs/run_query.py
+      - USER=root
+      - HADOOP_USER_NAME=root
+    volumes:
+      - ./spark:/opt/spark_jobs
+    depends_on:
+      - spark-master
+      - kafka
+    restart: unless-stopped
     networks: [lambda-net]
 
   # Prometheus + exporters

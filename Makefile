@@ -1,5 +1,5 @@
 # =========================
-# Open-Meteo Lambda — Make
+# Open-Meteo Lambda — Make (fusion A ∪ B)
 # =========================
 
 SHELL := /bin/bash
@@ -16,21 +16,21 @@ endif
 TZ ?= Europe/Paris
 HOST ?= localhost
 
-KAFKA_BROKER ?= kafka:9092
-TOPIC_RAW ?= weather.raw.openmeteo
-TOPIC_HOURLY ?= weather.hourly.flattened
-TOPIC_CURRENT ?= weather.current.metrics
-TOPIC_Q_REQ ?= weather.queries.requests
-TOPIC_Q_RES ?= weather.queries.results
+KAFKA_BROKER   ?= kafka:9092
+TOPIC_RAW      ?= weather.raw.openmeteo
+TOPIC_HOURLY   ?= weather.hourly.flattened
+TOPIC_CURRENT  ?= weather.current.metrics
+TOPIC_Q_REQ    ?= weather.queries.requests
+TOPIC_Q_RES    ?= weather.queries.results
 
-PORT_GRAFANA   ?= 3000
-PORT_AIRFLOW   ?= 8088
-PORT_SPARK     ?= 8080
-PORT_STREAMLIT ?= 8501
-PORT_PROM      ?= 9090
-PORT_KAFKAUI   ?= 8081
-PORT_HDFS_NN   ?= 9870
-PORT_HDFS_DN   ?= 9864
+PORT_GRAFANA    ?= 3000
+PORT_AIRFLOW    ?= 8088
+PORT_SPARK      ?= 8080
+PORT_STREAMLIT  ?= 8501
+PORT_PROM       ?= 9090
+PORT_KAFKAUI    ?= 8081
+PORT_HDFS_NN    ?= 9870
+PORT_HDFS_DN    ?= 9864
 
 KAFKA_TOPICS := /opt/bitnami/kafka/bin/kafka-topics.sh
 
@@ -44,18 +44,23 @@ ifeq ($(shell uname),Darwin)
 OPEN_CMD := open
 endif
 
-URL_GRAFANA   := http://$(HOST):$(PORT_GRAFANA)/
-URL_AIRFLOW   := http://$(HOST):$(PORT_AIRFLOW)/
-URL_SPARK     := http://$(HOST):$(PORT_SPARK)/
-URL_STREAMLIT := http://$(HOST):$(PORT_STREAMLIT)/
-URL_PROM      := http://$(HOST):$(PORT_PROM)/
-URL_KAFKAUI   := http://$(HOST):$(PORT_KAFKAUI)/
-URL_HDFS_NN := http://$(HOST):$(PORT_HDFS_NN)/
-URL_HDFS_DN := http://$(HOST):$(PORT_HDFS_DN)/
+URL_GRAFANA    := http://$(HOST):$(PORT_GRAFANA)/
+URL_AIRFLOW    := http://$(HOST):$(PORT_AIRFLOW)/
+URL_SPARK      := http://$(HOST):$(PORT_SPARK)/
+URL_STREAMLIT  := http://$(HOST):$(PORT_STREAMLIT)/
+URL_PROM       := http://$(HOST):$(PORT_PROM)/
+URL_KAFKAUI    := http://$(HOST):$(PORT_KAFKAUI)/
+URL_HDFS_NN    := http://$(HOST):$(PORT_HDFS_NN)/
+URL_HDFS_DN    := http://$(HOST):$(PORT_HDFS_DN)/
 
-.PHONY: run up wait-kafka wait-airflow seed-topics spark-streaming spark-streaming-localfs spark-streaming-hdfs airflow-batch stop down logs show-infra status urls \
-        open-grafana open-airflow open-spark open-streamlit open-prom open-kafkaui check-env clean-all nuke
+.PHONY: run up wait-kafka wait-airflow seed-topics spark-streaming spark-streaming-localfs spark-streaming-hdfs \
+        airflow-batch stop down logs show-infra status urls \
+        open-grafana open-airflow open-spark open-streamlit open-prom open-kafkaui open-hdfs-nn open-hdfs-dn \
+        check-env clean-all nuke
 
+# --------
+# Orchestrations
+# --------
 run:
 	@echo "-> Démarrage de la stack..."
 	$(MAKE) up
@@ -76,6 +81,9 @@ up:
 	@echo "-> docker compose up -d --build --force-recreate"
 	@docker compose up -d --build --force-recreate
 
+# --------
+# Checks readiness
+# --------
 wait-kafka:
 	@retries=30; \
 	while [ $$retries -gt 0 ]; do \
@@ -89,6 +97,7 @@ wait-kafka:
 	done; \
 	echo "-> Kafka n'a pas démarré à temps." && exit 1
 
+# Airflow 3.x: health via API v2
 wait-airflow:
 	@retries=40; \
 	while [ $$retries -gt 0 ]; do \
@@ -102,6 +111,9 @@ wait-airflow:
 	done; \
 	echo "-> Airflow n'a pas démarré à temps." && exit 1
 
+# --------
+# Kafka topics
+# --------
 seed-topics:
 	@echo "-> Vérif variables:"
 	@echo "   RAW=$(TOPIC_RAW) | HOURLY=$(TOPIC_HOURLY) | CURRENT=$(TOPIC_CURRENT)"
@@ -113,7 +125,9 @@ seed-topics:
 	@docker compose exec -T kafka $(KAFKA_TOPICS) --create --if-not-exists --topic "$(TOPIC_Q_RES)"   --bootstrap-server "$(KAFKA_BROKER)" --partitions 3 --replication-factor 1
 	@echo "-> Topics créés (ou déjà existants)."
 
-# Par défaut: mode local (évite l'init Hadoop/UGI)
+# --------
+# Spark (par défaut: localfs pour éviter les soucis UGI/HDFS)
+# --------
 spark-streaming: spark-streaming-localfs
 
 spark-streaming-localfs:
@@ -130,10 +144,10 @@ spark-streaming-localfs:
 	    --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
 	    /opt/spark_jobs/streaming_hourly.py || true'
 
-# Quand tu voudras parler à HDFS:
+# Variante HDFS: si/quant tu veux écrire/lire depuis HDFS (namenode)
 spark-streaming-hdfs:
 	@echo "-> spark-submit (hdfs://namenode:8020)"
-	@docker compose exec -T spark-master bash -lc '\
+	@docker compose exec -T -e USER=root -e HADOOP_USER_NAME=root spark-master bash -lc '\
 	  spark-submit \
 	    --master spark://spark-master:7077 \
 	    --conf spark.jars.ivy=/tmp/.ivy2 \
@@ -145,10 +159,16 @@ spark-streaming-hdfs:
 	    --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
 	    /opt/spark_jobs/streaming_hourly.py || true'
 
+# --------
+# Airflow (déclenchement DAG)
+# --------
 airflow-batch:
 	@echo "-> Déclenchement manuel d'un DAG batch dans Airflow"
 	@docker compose exec -T airflow-webserver airflow dags trigger batch_daily || true
 
+# --------
+# Infra utils
+# --------
 stop:
 	@echo "-> docker compose stop"
 	@docker compose stop
@@ -187,7 +207,6 @@ urls:
 	@printf "   Prometheus  -> "; $(call link,$(URL_PROM),$(URL_PROM)); echo
 	@printf "   Kafka UI    -> "; $(call link,$(URL_KAFKAUI),$(URL_KAFKAUI)); echo
 
-
 open-grafana:
 	@$(OPEN_CMD) "$(URL_GRAFANA)" >/dev/null 2>&1 & echo "-> $(URL_GRAFANA)"
 
@@ -206,6 +225,12 @@ open-prom:
 open-kafkaui:
 	@$(OPEN_CMD) "$(URL_KAFKAUI)" >/dev/null 2>&1 & echo "-> $(URL_KAFKAUI)"
 
+open-hdfs-nn:
+	@$(OPEN_CMD) "$(URL_HDFS_NN)" >/dev/null 2>&1 & echo "-> $(URL_HDFS_NN)"
+
+open-hdfs-dn:
+	@$(OPEN_CMD) "$(URL_HDFS_DN)" >/dev/null 2>&1 & echo "-> $(URL_HDFS_DN)"
+
 check-env:
 	@echo "-> ENV:"
 	@echo "  TZ=$(TZ)"
@@ -220,6 +245,8 @@ check-env:
 	@echo "   $(URL_GRAFANA)"
 	@echo "   $(URL_AIRFLOW)"
 	@echo "   $(URL_SPARK)"
+	@echo "   $(URL_HDFS_NN)"
+	@echo "   $(URL_HDFS_DN)"
 	@echo "   $(URL_STREAMLIT)"
 	@echo "   $(URL_PROM)"
 	@echo "   $(URL_KAFKAUI)"
