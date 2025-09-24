@@ -1,7 +1,7 @@
 {
   "version": 1,
   "updated_at": "2025-09-24T12:00:00Z",
-  "updated_by": "hello",
+  "updated_by": "bootstrap",
   "cities": [
     {
       "id": "paris-fr",
@@ -9,6 +9,14 @@
       "country": "FR",
       "lat": 48.8566,
       "lon": 2.3522,
+      "active": true
+    },
+    {
+      "id": "lyon-fr",
+      "name": "Lyon",
+      "country": "FR",
+      "lat": 45.764,
+      "lon": 4.8357,
       "active": true
     }
   ]

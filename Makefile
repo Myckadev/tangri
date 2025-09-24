@@ -29,6 +29,8 @@ PORT_SPARK     ?= 8080
 PORT_STREAMLIT ?= 8501
 PORT_PROM      ?= 9090
 PORT_KAFKAUI   ?= 8081
+PORT_HDFS_NN   ?= 9870
+PORT_HDFS_DN   ?= 9864
 
 KAFKA_TOPICS := /opt/bitnami/kafka/bin/kafka-topics.sh
 
@@ -48,8 +50,10 @@ URL_SPARK     := http://$(HOST):$(PORT_SPARK)/
 URL_STREAMLIT := http://$(HOST):$(PORT_STREAMLIT)/
 URL_PROM      := http://$(HOST):$(PORT_PROM)/
 URL_KAFKAUI   := http://$(HOST):$(PORT_KAFKAUI)/
+URL_HDFS_NN := http://$(HOST):$(PORT_HDFS_NN)/
+URL_HDFS_DN := http://$(HOST):$(PORT_HDFS_DN)/
 
-.PHONY: run up wait-kafka wait-airflow seed-topics spark-streaming airflow-batch stop down logs show-infra status urls \
+.PHONY: run up wait-kafka wait-airflow seed-topics spark-streaming spark-streaming-localfs spark-streaming-hdfs airflow-batch stop down logs show-infra status urls \
         open-grafana open-airflow open-spark open-streamlit open-prom open-kafkaui check-env clean-all nuke
 
 run:
@@ -66,18 +70,11 @@ run:
 	@echo "-> Déclenchement du batch via Airflow..."
 	$(MAKE) airflow-batch
 	@echo ""
-	@echo "-> Stack prête. UIs :"
-	@printf "   Grafana    -> "; $(call link,$(URL_GRAFANA),$(URL_GRAFANA)); echo
-	@printf "   Airflow    -> "; $(call link,$(URL_AIRFLOW),$(URL_AIRFLOW)); echo
-	@printf "   Spark UI   -> "; $(call link,$(URL_SPARK),$(URL_SPARK)); echo
-	@printf "   Streamlit  -> "; $(call link,$(URL_STREAMLIT),$(URL_STREAMLIT)); echo
-	@printf "   Prometheus -> "; $(call link,$(URL_PROM),$(URL_PROM)); echo
-	@printf "   Kafka UI   -> "; $(call link,$(URL_KAFKAUI),$(URL_KAFKAUI)); echo
-	@echo ""
+	$(MAKE) status
 
 up:
-	@echo "-> docker compose up -d --build"
-	@docker compose up -d --build
+	@echo "-> docker compose up -d --build --force-recreate"
+	@docker compose up -d --build --force-recreate
 
 wait-kafka:
 	@retries=30; \
@@ -95,7 +92,7 @@ wait-kafka:
 wait-airflow:
 	@retries=40; \
 	while [ $$retries -gt 0 ]; do \
-	  if docker compose exec -T airflow-webserver bash -lc "curl -fsS http://localhost:8080/health | grep -q healthy"; then \
+	  if docker compose exec -T airflow-webserver bash -lc "curl -fsS http://localhost:8080/api/v2/monitor/health | grep -q '\"status\":\"healthy\"'"; then \
 	    echo "-> Airflow est prêt."; exit 0; \
 	  else \
 	    echo "-> Airflow pas encore prêt, nouvelle tentative"; \
@@ -116,17 +113,37 @@ seed-topics:
 	@docker compose exec -T kafka $(KAFKA_TOPICS) --create --if-not-exists --topic "$(TOPIC_Q_RES)"   --bootstrap-server "$(KAFKA_BROKER)" --partitions 3 --replication-factor 1
 	@echo "-> Topics créés (ou déjà existants)."
 
-spark-streaming:
-	@echo "-> spark-submit streaming_hourly.py"
-	@docker compose exec -T spark-master spark-submit \
-	  --master spark://spark-master:7077 \
-	  --conf spark.jars.ivy=/tmp/.ivy2 \
-	  --conf spark.hadoop.fs.defaultFS=hdfs://namenode:8020 \
-	  --conf spark.hadoop.hadoop.security.authentication=simple \
-	  --conf spark.driver.extraJavaOptions="-Duser.name=root" \
-	  --conf spark.executor.extraJavaOptions="-Duser.name=root" \
-	  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
-	  /opt/spark_jobs/streaming_hourly.py || true
+# Par défaut: mode local (évite l'init Hadoop/UGI)
+spark-streaming: spark-streaming-localfs
+
+spark-streaming-localfs:
+	@echo "-> spark-submit (file://)"
+	@docker compose exec -T spark-master bash -lc '\
+	  spark-submit \
+	    --master spark://spark-master:7077 \
+	    --conf spark.jars.ivy=/tmp/.ivy2 \
+	    --conf spark.hadoop.fs.defaultFS=file:/// \
+	    --conf spark.hadoop.hadoop.security.authentication=simple \
+	    --conf spark.driver.extraJavaOptions="-Duser.name=$$USER" \
+	    --conf spark.executor.extraJavaOptions="-Duser.name=$$USER" \
+	    --conf spark.executorEnv.USER=$$USER \
+	    --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
+	    /opt/spark_jobs/streaming_hourly.py || true'
+
+# Quand tu voudras parler à HDFS:
+spark-streaming-hdfs:
+	@echo "-> spark-submit (hdfs://namenode:8020)"
+	@docker compose exec -T spark-master bash -lc '\
+	  spark-submit \
+	    --master spark://spark-master:7077 \
+	    --conf spark.jars.ivy=/tmp/.ivy2 \
+	    --conf spark.hadoop.fs.defaultFS=hdfs://namenode:8020 \
+	    --conf spark.hadoop.hadoop.security.authentication=simple \
+	    --conf spark.driver.extraJavaOptions="-Duser.name=$$USER" \
+	    --conf spark.executor.extraJavaOptions="-Duser.name=$$USER" \
+	    --conf spark.executorEnv.USER=$$USER \
+	    --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
+	    /opt/spark_jobs/streaming_hourly.py || true'
 
 airflow-batch:
 	@echo "-> Déclenchement manuel d'un DAG batch dans Airflow"
@@ -150,21 +167,26 @@ status:
 	@echo "-> Conteneurs:" && docker compose ps
 	@echo "\n-> Topics Kafka:" && docker compose exec -T kafka $(KAFKA_TOPICS) --bootstrap-server $(KAFKA_BROKER) --list || true
 	@echo "\n-> UIs:"
-	@printf "   Grafana    -> "; $(call link,$(URL_GRAFANA),$(URL_GRAFANA)); echo
-	@printf "   Airflow    -> "; $(call link,$(URL_AIRFLOW),$(URL_AIRFLOW)); echo
-	@printf "   Spark UI   -> "; $(call link,$(URL_SPARK),$(URL_SPARK)); echo
-	@printf "   Streamlit  -> "; $(call link,$(URL_STREAMLIT),$(URL_STREAMLIT)); echo
-	@printf "   Prometheus -> "; $(call link,$(URL_PROM),$(URL_PROM)); echo
-	@printf "   Kafka UI   -> "; $(call link,$(URL_KAFKAUI),$(URL_KAFKAUI)); echo
+	@printf "   Grafana     -> "; $(call link,$(URL_GRAFANA),$(URL_GRAFANA)); echo
+	@printf "   Airflow     -> "; $(call link,$(URL_AIRFLOW),$(URL_AIRFLOW)); echo
+	@printf "   Spark UI    -> "; $(call link,$(URL_SPARK),$(URL_SPARK)); echo
+	@printf "   NameNode    -> "; $(call link,$(URL_HDFS_NN),$(URL_HDFS_NN)); echo
+	@printf "   DataNode    -> "; $(call link,$(URL_HDFS_DN),$(URL_HDFS_DN)); echo
+	@printf "   Streamlit   -> "; $(call link,$(URL_STREAMLIT),$(URL_STREAMLIT)); echo
+	@printf "   Prometheus  -> "; $(call link,$(URL_PROM),$(URL_PROM)); echo
+	@printf "   Kafka UI    -> "; $(call link,$(URL_KAFKAUI),$(URL_KAFKAUI)); echo
 
 urls:
 	@echo "-> UIs:"
-	@printf "   Grafana    -> "; $(call link,$(URL_GRAFANA),$(URL_GRAFANA)); echo
-	@printf "   Airflow    -> "; $(call link,$(URL_AIRFLOW),$(URL_AIRFLOW)); echo
-	@printf "   Spark UI   -> "; $(call link,$(URL_SPARK),$(URL_SPARK)); echo
-	@printf "   Streamlit  -> "; $(call link,$(URL_STREAMLIT),$(URL_STREAMLIT)); echo
-	@printf "   Prometheus -> "; $(call link,$(URL_PROM),$(URL_PROM)); echo
-	@printf "   Kafka UI   -> "; $(call link,$(URL_KAFKAUI),$(URL_KAFKAUI)); echo
+	@printf "   Grafana     -> "; $(call link,$(URL_GRAFANA),$(URL_GRAFANA)); echo
+	@printf "   Airflow     -> "; $(call link,$(URL_AIRFLOW),$(URL_AIRFLOW)); echo
+	@printf "   Spark UI    -> "; $(call link,$(URL_SPARK),$(URL_SPARK)); echo
+	@printf "   NameNode    -> "; $(call link,$(URL_HDFS_NN),$(URL_HDFS_NN)); echo
+	@printf "   DataNode    -> "; $(call link,$(URL_HDFS_DN),$(URL_HDFS_DN)); echo
+	@printf "   Streamlit   -> "; $(call link,$(URL_STREAMLIT),$(URL_STREAMLIT)); echo
+	@printf "   Prometheus  -> "; $(call link,$(URL_PROM),$(URL_PROM)); echo
+	@printf "   Kafka UI    -> "; $(call link,$(URL_KAFKAUI),$(URL_KAFKAUI)); echo
+
 
 open-grafana:
 	@$(OPEN_CMD) "$(URL_GRAFANA)" >/dev/null 2>&1 & echo "-> $(URL_GRAFANA)"

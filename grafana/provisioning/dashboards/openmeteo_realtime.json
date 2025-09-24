@@ -1,0 +1,47 @@
+{
+  "title": "Open-Meteo Realtime",
+  "uid": "openmeteo-realtime",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "templating": {
+    "list": [
+      {
+        "name": "city_id",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": "label_values(openmeteo_city_events_total, city_id)",
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Prometheus Targets UP",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [{ "expr": "sum(up)", "legendFormat": "up" }],
+      "options": {"reduceOptions": {"calcs": ["last"]}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Événements par ville (producer)",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 4},
+      "targets": [
+        {
+          "expr": "sum(rate(openmeteo_city_events_total{city_id=~\"$city_id\"}[1m])) by (city_name)",
+          "legendFormat": "{{city_name}}"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Consumer lag (group/topic)",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 12},
+      "targets": [{ "expr": "sum(kafka_consumergroup_lag) by (consumergroup, topic)" }],
+      "options": {"showHeader": true}
+    }
+  ]
+}

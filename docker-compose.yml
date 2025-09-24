@@ -82,6 +82,8 @@ services:
     environment:
       - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
     depends_on: [namenode]
+    ports:
+      - "9864:9864"
     volumes:
       - hdfs-dn:/hadoop/dfs/data
     networks: [lambda-net]
@@ -89,10 +91,12 @@ services:
   spark-master:
     image: bitnami/spark:3.5
     <<: *env
+    user: "0:0"                        # utilisateur Unix valide (root)
     environment:
       - SPARK_MODE=master
       - HOME=/opt/spark
       - HADOOP_USER_NAME=root
+      - USER=root
     depends_on: [datanode]
     ports:
       - "8080:8080"   # Spark Master UI
@@ -102,11 +106,13 @@ services:
   spark-worker-1:
     image: bitnami/spark:3.5
     <<: *env
+    user: "0:0"
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:7077
       - HOME=/opt/spark
       - HADOOP_USER_NAME=root
+      - USER=root
     depends_on: [spark-master]
     networks: [lambda-net]
 
@@ -123,21 +129,30 @@ services:
     networks: [lambda-net]
 
   airflow-init:
-    image: apache/airflow:2.9.1-python3.11
-    <<: *env
+    build:
+      context: ./airflow
+      args:
+        AIRFLOW_VERSION: "3.0.6"
+        PYTHON_VERSION: "3.11"
+    env_file: [.env]
     user: "${AIRFLOW_UID:-50000}:0"
     environment:
-      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__STORE_SERIALIZED_DAGS: "True"          # <- important
+      AIRFLOW__CORE__MIN_SERIALIZED_DAG_UPDATE_INTERVAL: "5"
     depends_on:
       - postgres
     volumes:
       - airflow-dags:/opt/airflow/dags
       - airflow-logs:/opt/airflow/logs
       - airflow-plugins:/opt/airflow/plugins
-      - ./airflow/dags:/opt/airflow/dags  # tes DAGs locaux
+      - ./airflow/dags:/opt/airflow/dags
+      - ./spark:/opt/spark_jobs
+      - ./conf:/opt/conf
     entrypoint: >
       bash -lc "
         airflow db migrate &&
@@ -146,20 +161,27 @@ services:
     networks: [lambda-net]
 
   airflow-webserver:
-    image: apache/airflow:2.9.1-python3.11
-    <<: *env
+    build:
+      context: ./airflow
+      args:
+        AIRFLOW_VERSION: "3.0.6"
+        PYTHON_VERSION: "3.11"
+    env_file: [.env]
     user: "${AIRFLOW_UID:-50000}:0"
     environment:
-      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
-      AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: ${TZ:-Europe/Paris}
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__STORE_SERIALIZED_DAGS: "True"          # <- important
+      AIRFLOW__CORE__MIN_SERIALIZED_DAG_UPDATE_INTERVAL: "5"
     depends_on:
       postgres:
         condition: service_started
       airflow-init:
         condition: service_completed_successfully
+    command: ["bash","-lc","exec airflow api-server"]
     volumes:
       - airflow-dags:/opt/airflow/dags
       - airflow-logs:/opt/airflow/logs
@@ -167,28 +189,35 @@ services:
       - ./airflow/dags:/opt/airflow/dags
       - ./spark:/opt/spark_jobs
       - ./conf:/opt/conf
-    command: ["bash","-lc","exec airflow webserver"]
     ports:
       - "8088:8080"
     healthcheck:
-      test: ["CMD-SHELL","curl -fsS http://localhost:8080/health | grep -q 'healthy'"]
+      test: [ "CMD-SHELL","curl -fsS http://localhost:8080/api/v2/monitor/health | grep -q '\"status\":\"healthy\"'" ]
       interval: 10s
       timeout: 5s
       retries: 30
     networks: [lambda-net]
 
   airflow-scheduler:
-    image: apache/airflow:2.9.1-python3.11
-    <<: *env
+    build:
+      context: ./airflow
+      args:
+        AIRFLOW_VERSION: "3.0.6"
+        PYTHON_VERSION: "3.11"
+    env_file: [.env]
     user: "${AIRFLOW_UID:-50000}:0"
     environment:
-      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__STORE_SERIALIZED_DAGS: "True"          # <- important
+      AIRFLOW__CORE__MIN_SERIALIZED_DAG_UPDATE_INTERVAL: "5"
     depends_on:
       airflow-webserver:
         condition: service_healthy
+    command: ["bash","-lc","exec airflow scheduler"]
     volumes:
       - airflow-dags:/opt/airflow/dags
       - airflow-logs:/opt/airflow/logs
@@ -196,8 +225,36 @@ services:
       - ./airflow/dags:/opt/airflow/dags
       - ./spark:/opt/spark_jobs
       - ./conf:/opt/conf
-    command: ["bash","-lc","exec airflow scheduler"]
     networks: [lambda-net]
+
+  airflow-dag-processor:
+    build:
+      context: ./airflow
+      args:
+        AIRFLOW_VERSION: "3.0.6"
+        PYTHON_VERSION: "3.11"
+    env_file: [ .env ]
+    user: "${AIRFLOW_UID:-50000}:0"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__STORE_SERIALIZED_DAGS: "True"
+      AIRFLOW__CORE__MIN_SERIALIZED_DAG_UPDATE_INTERVAL: "5"
+    depends_on:
+      airflow-webserver:
+        condition: service_healthy
+    command: [ "bash","-lc","exec airflow dag-processor" ]
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - airflow-plugins:/opt/airflow/plugins
+      - ./spark:/opt/spark_jobs
+      - ./conf:/opt/conf
+    networks: [ lambda-net ]
+
   # ---------------------------------------------------------------
 
   # Backend FastAPI — endpoints /config (villes), /query (requêtes batch)
