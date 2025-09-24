@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# OS / Editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Env
+.env
+!.env.example
+
+# Logs
+*.log
+logs/
+tmp/
+.cache/
+
+# Streamlit
+.streamlit/
+
+# Spark checkpoints (if mounted)
+chk-*/
+checkpoint*/
