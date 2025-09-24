@@ -1,0 +1,283 @@
+# Stack Open-Meteo Lambda: Kafka + Spark + HDFS + Airflow (Postgres + init) + FastAPI + Streamlit + Prometheus + Grafana
+x-env: &env
+  env_file:
+    - .env
+  environment:
+    TZ: ${TZ:-Europe/Paris}
+
+networks:
+  lambda-net:
+    driver: bridge
+
+volumes:
+  hdfs-nn: {}
+  hdfs-dn: {}
+  prometheus-data: {}
+  grafana-data: {}
+  # Airflow/Postgres
+  postgres-data: {}
+  airflow-logs: {}
+  airflow-dags: {}
+  airflow-plugins: {}
+
+services:
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    <<: *env
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+    networks: [lambda-net]
+
+  kafka:
+    image: bitnami/kafka:3.7
+    <<: *env
+    depends_on: [zookeeper]
+    environment:
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=false
+      - ALLOW_PLAINTEXT_LISTENER=yes
+    ports:
+      - "9092:9092"
+    networks: [lambda-net]
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    ports:
+      - "8081:8080"
+    depends_on:
+      - kafka
+      - zookeeper
+    networks: [ lambda-net ]
+
+  # Exporter Prometheus pour Kafka (lag consumer, etc.)
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    <<: *env
+    command: ["--kafka.server=kafka:9092", "--zookeeper.server=zookeeper:2181"]
+    depends_on: [kafka]
+    ports:
+      - "9308:9308"
+    networks: [lambda-net]
+
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    <<: *env
+    environment:
+      - CLUSTER_NAME=lambda
+    ports:
+      - "9870:9870"   # HDFS NameNode UI
+    volumes:
+      - hdfs-nn:/hadoop/dfs/name
+    networks: [lambda-net]
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    <<: *env
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+    depends_on: [namenode]
+    volumes:
+      - hdfs-dn:/hadoop/dfs/data
+    networks: [lambda-net]
+
+  spark-master:
+    image: bitnami/spark:3.5
+    <<: *env
+    environment:
+      - SPARK_MODE=master
+      - HOME=/opt/spark
+      - HADOOP_USER_NAME=root
+    depends_on: [datanode]
+    ports:
+      - "8080:8080"   # Spark Master UI
+      - "7077:7077"   # Spark Master RPC
+    networks: [lambda-net]
+
+  spark-worker-1:
+    image: bitnami/spark:3.5
+    <<: *env
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - HOME=/opt/spark
+      - HADOOP_USER_NAME=root
+    depends_on: [spark-master]
+    networks: [lambda-net]
+
+  # ---------- Airflow (mix "officiel" + stack globale) ----------
+  postgres:
+    image: postgres:15-alpine
+    <<: *env
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [lambda-net]
+
+  airflow-init:
+    image: apache/airflow:2.9.1-python3.11
+    <<: *env
+    user: "${AIRFLOW_UID:-50000}:0"
+    environment:
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    depends_on:
+      - postgres
+    volumes:
+      - airflow-dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - airflow-plugins:/opt/airflow/plugins
+      - ./airflow/dags:/opt/airflow/dags  # tes DAGs locaux
+    entrypoint: >
+      bash -lc "
+        airflow db migrate &&
+        airflow users create --username admin --password admin --firstname a --lastname b --role Admin --email a@b.c || true
+      "
+    networks: [lambda-net]
+
+  airflow-webserver:
+    image: apache/airflow:2.9.1-python3.11
+    <<: *env
+    user: "${AIRFLOW_UID:-50000}:0"
+    environment:
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: ${TZ:-Europe/Paris}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    depends_on:
+      postgres:
+        condition: service_started
+      airflow-init:
+        condition: service_completed_successfully
+    volumes:
+      - airflow-dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - airflow-plugins:/opt/airflow/plugins
+      - ./airflow/dags:/opt/airflow/dags
+      - ./spark:/opt/spark_jobs
+      - ./conf:/opt/conf
+    command: ["bash","-lc","exec airflow webserver"]
+    ports:
+      - "8088:8080"
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS http://localhost:8080/health | grep -q 'healthy'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks: [lambda-net]
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.1-python3.11
+    <<: *env
+    user: "${AIRFLOW_UID:-50000}:0"
+    environment:
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    depends_on:
+      airflow-webserver:
+        condition: service_healthy
+    volumes:
+      - airflow-dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - airflow-plugins:/opt/airflow/plugins
+      - ./airflow/dags:/opt/airflow/dags
+      - ./spark:/opt/spark_jobs
+      - ./conf:/opt/conf
+    command: ["bash","-lc","exec airflow scheduler"]
+    networks: [lambda-net]
+  # ---------------------------------------------------------------
+
+  # Backend FastAPI — endpoints /config (villes), /query (requêtes batch)
+  backend:
+    build: ./backend
+    image: openmeteo-backend:latest
+    <<: *env
+    environment:
+      - KAFKA_BROKER=${KAFKA_BROKER:-kafka:9092}
+      - TOPIC_Q_REQ=${TOPIC_Q_REQ:-weather.queries.requests}
+      - TOPIC_Q_RES=${TOPIC_Q_RES:-weather.queries.results}
+    volumes:
+      - ./conf:/app/conf
+    depends_on: [kafka]
+    ports:
+      - "8000:8000"
+    networks: [lambda-net]
+
+  # Producteur Open-Meteo (API → Kafka RAW)
+  producer:
+    build: ./producer
+    image: openmeteo-producer:latest
+    <<: *env
+    environment:
+      - KAFKA_BROKER=${KAFKA_BROKER:-kafka:9092}
+      - TOPIC_RAW=${TOPIC_RAW:-weather.raw.openmeteo}
+      - CITIES_FILE=/app/conf/cities.json
+    volumes:
+      - ./conf:/app/conf
+    depends_on: [kafka]
+    restart: unless-stopped
+    networks: [lambda-net]
+
+  # Streamlit — Frontend 2 (config villes + requêtes batch)
+  streamlit:
+    build: ./streamlit
+    image: openmeteo-streamlit:latest
+    <<: *env
+    depends_on: [backend]
+    ports:
+      - "8501:8501"
+    networks: [lambda-net]
+
+  # Prometheus + exporters
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    <<: *env
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks: [lambda-net]
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    <<: *env
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - "8085:8080"
+    networks: [lambda-net]
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    <<: *env
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+    networks: [lambda-net]

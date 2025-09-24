@@ -30,3 +30,5 @@ tmp/
 # Spark checkpoints (if mounted)
 chk-*/
 checkpoint*/
+
+*.pdf

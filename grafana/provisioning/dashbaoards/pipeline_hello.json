@@ -1,0 +1,21 @@
+{
+  "id": null,
+  "title": "Pipeline Hello",
+  "timezone": "browser",
+  "schemaVersion": 36,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Prometheus is up",
+      "targets": [
+        {
+          "expr": "up{job=\"prometheus\"}",
+          "legendFormat": "prometheus"
+        }
+      ],
+      "datasource": "Prometheus"
+    }
+  ]
+}

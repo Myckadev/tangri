@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "updated_at": "2025-09-24T12:00:00Z",
+  "updated_by": "hello",
+  "cities": [
+    {
+      "id": "paris-fr",
+      "name": "Paris",
+      "country": "FR",
+      "lat": 48.8566,
+      "lon": 2.3522,
+      "active": true
+    }
+  ]
+}
