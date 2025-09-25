@@ -1,13 +1,15 @@
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType, ArrayType
+from pyspark.sql.types import (
+    StructType, StructField, StringType, DoubleType, ArrayType, TimestampType
+)
 import os
 
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
 TOPIC_RAW = os.getenv("TOPIC_RAW", "weather.raw.openmeteo")
 TOPIC_HOURLY = os.getenv("TOPIC_HOURLY", "weather.hourly.flattened")
 HDFS_BASE = os.getenv("HDFS_BASE", "hdfs://namenode:8020/datalake")
-
+CHECKPOINT = os.getenv("STREAM_CHECKPOINT", f"{HDFS_BASE}/checkpoints/hourly")
 
 def build_spark() -> SparkSession:
     spark = (
@@ -18,9 +20,8 @@ def build_spark() -> SparkSession:
     spark.sparkContext.setLogLevel("WARN")
     return spark
 
-
 def read_kafka(spark: SparkSession) -> DataFrame:
-    return (
+    df = (
         spark.readStream
         .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BROKER)
@@ -28,40 +29,10 @@ def read_kafka(spark: SparkSession) -> DataFrame:
         .option("startingOffsets", "latest")
         .load()
     )
+    return df.select(F.col("value").cast("string").alias("value"))
 
-
-def normalize(df: DataFrame) -> DataFrame:
-    # value is bytes -> string -> json
-    df_str = df.select(F.col("key").cast("string"), F.col("value").cast("string").alias("value"))
-
-    # We expect envelope { _meta: {...}, raw: {...} }
-    # Extract only a few useful hourly fields
-    meta_schema = StructType([
-        StructField("source", StringType(), True),
-        StructField("ingested_at", StringType(), True),
-        StructField("city_id", StringType(), True),
-        StructField("city_name", StringType(), True),
-        StructField("country", StringType(), True),
-    ])
-
-    # Parse JSON
-    parsed = df_str.select(F.from_json("value", StructType([
-        StructField("_meta", meta_schema, True),
-        StructField("raw", F.MapType(StringType(), F.StringType(), True), True)
-    ])).alias("data")).select("data.*")
-
-    # Extract hourly arrays using get_json_object for simplicity
-    raw_json = df_str.select(F.col("value").alias("raw_json"))
-    # Better approach: re-parse with schema, but open-meteo schema can vary. We'll use JSON functions.
-    v = F.col("value")
-    j = F.from_json(v, StringType())  # noop placeholder to keep API consistent
-
-    # Re-parse with a permissive generic map
-    parsed_generic = df_str.select(
-        F.from_json("value", "map<string,string>").alias("m")
-    )
-
-    # For robustness, we extract needed fields via get_json_object
+def normalize(df_str: DataFrame) -> DataFrame:
+    # Extract needed fields with get_json_object, then cast/parse
     base = df_str.select(
         F.get_json_object("value", '$._meta.city_id').alias("city_id"),
         F.get_json_object("value", '$._meta.city_name').alias("city_name"),
@@ -73,73 +44,68 @@ def normalize(df: DataFrame) -> DataFrame:
         F.get_json_object("value", '$.raw.hourly.wind_speed_10m').alias("wind"),
     )
 
-    # Convert JSON arrays to arrays of strings/doubles
-    def to_array(col):
-        return F.from_json(col, ArrayType(StringType()))
-    def to_array_d(col):
-        return F.from_json(col, ArrayType(DoubleType()))
+    to_arr_str = lambda c: F.from_json(c, ArrayType(StringType()))
+    to_arr_dbl = lambda c: F.from_json(c, ArrayType(DoubleType()))
 
     arr = base.select(
         "city_id", "city_name", "country", "ingested_at",
-        to_array("times").alias("times"),
-        to_array_d("temps").alias("temps"),
-        to_array_d("humidity").alias("humidity"),
-        to_array_d("wind").alias("wind"),
+        to_arr_str("times").alias("times"),
+        to_arr_dbl("temps").alias("temps"),
+        to_arr_dbl("humidity").alias("humidity"),
+        to_arr_dbl("wind").alias("wind"),
     )
 
-    # Explode arrays to rows
-    exploded = arr.select(
+    # zip arrays into struct per index
+    zipped = arr.select(
         "city_id", "city_name", "country", "ingested_at",
-        F.posexplode("times").alias("idx", "time"),
-        "temps", "humidity", "wind"
-    ).select(
-        "city_id", "city_name", "country", "ingested_at", "time",
-        F.col("temps")[F.col("idx")].alias("temperature_2m"),
-        F.col("humidity")[F.col("idx")].alias("relative_humidity_2m"),
-        F.col("wind")[F.col("idx")].alias("wind_speed_10m"),
-    )
+        F.arrays_zip("times", "temps", "humidity", "wind").alias("z")
+    ).selectExpr("city_id", "city_name", "country", "ingested_at", "explode(z) as e")
 
-    # Derive date partitions
-    normalized = exploded.withColumn("date", F.to_date("time")).withColumn("hour", F.date_format("time", "HH"))
+    out = zipped.select(
+        "city_id", "city_name", "country",
+        F.to_timestamp(F.col("e.times")).alias("hour_ts"),
+        F.col("e.temps").cast("double").alias("temperature_2m"),
+        F.col("e.humidity").cast("double").alias("relative_humidity_2m"),
+        F.col("e.wind").cast("double").alias("wind_speed_10m"),
+    ).withColumn("date", F.to_date("hour_ts"))
 
-    return normalized
-
+    return out
 
 def write_hdfs(df: DataFrame):
-    out_path = f"{HDFS_BASE}/silver/weather/hourly"
     return (
         df.writeStream
         .format("parquet")
-        .option("path", out_path)
-        .option("checkpointLocation", f"{HDFS_BASE}/_chk/weather_hourly_ckpt")
-        .partitionBy("date", "city_id")
+        .option("path", f"{HDFS_BASE}/bronze/hourly")
+        .option("checkpointLocation", CHECKPOINT)
         .outputMode("append")
     )
 
-
 def to_kafka_sink(df: DataFrame):
-    # Serialize as JSON
-    as_json = df.select(
-        F.to_json(F.struct(*df.columns)).alias("value")
+    # serialize to JSON for Kafka
+    j = F.to_json(F.struct(
+        "city_id", "city_name", "country",
+        F.date_format("hour_ts", "yyyy-MM-dd'T'HH:mm:ss'Z'").alias("hour_ts"),
+        "temperature_2m", "relative_humidity_2m", "wind_speed_10m"
+    ))
+    payload = df.select(
+        F.concat_ws("|", "city_id", F.date_format("hour_ts", "yyyyMMddHH")).alias("key"),
+        j.alias("value")
     )
     return (
-        as_json.writeStream
+        payload.writeStream
         .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BROKER)
         .option("topic", TOPIC_HOURLY)
-        .option("checkpointLocation", f"{HDFS_BASE}/_chk/weather_hourly_kafka_ckpt")
+        .option("checkpointLocation", f"{CHECKPOINT}_kafka")
         .outputMode("append")
     )
-
 
 if __name__ == "__main__":
     spark = build_spark()
     src = read_kafka(spark)
     norm = normalize(src)
-
-    # Two sinks: HDFS and Kafka
-    hdfs_q = write_hdfs(norm).start()
-    kafka_q = to_kafka_sink(norm).start()
-
-    hdfs_q.awaitTermination()
-    kafka_q.awaitTermination() 
+    # Sinks: HDFS & Kafka
+    q1 = write_hdfs(norm).start()
+    q2 = to_kafka_sink(norm).start()
+    q1.awaitTermination()
+    q2.awaitTermination()

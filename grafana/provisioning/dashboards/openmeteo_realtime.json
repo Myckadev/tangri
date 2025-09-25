@@ -3,7 +3,7 @@
   "uid": "openmeteo-realtime",
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "10s",
   "templating": {
     "list": [
@@ -37,9 +37,42 @@
       ]
     },
     {
+      "type": "timeseries",
+      "title": "Température actuelle (°C)",
+      "gridPos": {"h": 7, "w": 24, "x": 0, "y": 12},
+      "targets": [
+        {
+          "expr": "weather_temperature_2m{city_id=~\"$city_id\"}",
+          "legendFormat": "{{city_name}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Humidité relative actuelle (%)",
+      "gridPos": {"h": 7, "w": 24, "x": 0, "y": 19},
+      "targets": [
+        {
+          "expr": "weather_relative_humidity_2m{city_id=~\"$city_id\"}",
+          "legendFormat": "{{city_name}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Vent actuel (m/s)",
+      "gridPos": {"h": 7, "w": 24, "x": 0, "y": 26},
+      "targets": [
+        {
+          "expr": "weather_wind_speed_10m{city_id=~\"$city_id\"}",
+          "legendFormat": "{{city_name}}"
+        }
+      ]
+    },
+    {
       "type": "table",
       "title": "Consumer lag (group/topic)",
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 12},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 33},
       "targets": [{ "expr": "sum(kafka_consumergroup_lag) by (consumergroup, topic)" }],
       "options": {"showHeader": true}
     }

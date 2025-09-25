@@ -53,7 +53,8 @@ URL_KAFKAUI    := http://$(HOST):$(PORT_KAFKAUI)/
 URL_HDFS_NN    := http://$(HOST):$(PORT_HDFS_NN)/
 URL_HDFS_DN    := http://$(HOST):$(PORT_HDFS_DN)/
 
-.PHONY: run up wait-kafka wait-airflow seed-topics spark-streaming spark-streaming-localfs spark-streaming-hdfs \
+.PHONY: run up wait-kafka wait-airflow airflow-unpause-all seed-topics \
+        spark-streaming spark-streaming-localfs spark-streaming-hdfs \
         airflow-batch stop down logs show-infra status urls \
         open-grafana open-airflow open-spark open-streamlit open-prom open-kafkaui open-hdfs-nn open-hdfs-dn \
         check-env clean-all nuke
@@ -72,8 +73,6 @@ run:
 	$(MAKE) spark-streaming
 	@echo "-> Attente d'Airflow..."
 	$(MAKE) wait-airflow
-	@echo "-> Déclenchement du batch via Airflow..."
-	$(MAKE) airflow-batch
 	@echo ""
 	$(MAKE) status
 
@@ -158,13 +157,6 @@ spark-streaming-hdfs:
 	    --conf spark.executorEnv.USER=$$USER \
 	    --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
 	    /opt/spark_jobs/streaming_hourly.py || true'
-
-# --------
-# Airflow (déclenchement DAG)
-# --------
-airflow-batch:
-	@echo "-> Déclenchement manuel d'un DAG batch dans Airflow"
-	@docker compose exec -T airflow-webserver airflow dags trigger batch_daily || true
 
 # --------
 # Infra utils

@@ -1,131 +1,109 @@
-import json
-import logging
-import os
-import subprocess
-import sys
-import time
-from typing import Any, Dict
+# query_runner/service.py
+import json, logging, os, time
+from typing import Any, Dict, Optional
+from datetime import datetime, timezone
 
+import requests
 from kafka import KafkaConsumer, KafkaProducer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("query_runner")
+log = logging.getLogger("dag-launcher")
 
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
-TOPIC_Q_REQ = os.getenv("TOPIC_Q_REQ", "weather.queries.requests")
-TOPIC_Q_RES = os.getenv("TOPIC_Q_RES", "weather.queries.results")
-HDFS_BASE = os.getenv("HDFS_BASE", "hdfs://namenode:8020/datalake")
-SPARK_MASTER = os.getenv("SPARK_MASTER", "spark://spark-master:7077")
-SPARK_SCRIPT = os.getenv("SPARK_SCRIPT", "/opt/spark_jobs/run_query.py")
+TOPIC_Q_REQ  = os.getenv("TOPIC_Q_REQ", "weather.queries.requests")
+TOPIC_Q_RES  = os.getenv("TOPIC_Q_RES", "weather.queries.results")
 
+AIRFLOW_BASE    = os.getenv("AIRFLOW_BASE_URL", "http://airflow-webserver:8080")  # SANS /api/vN
+AIRFLOW_DAG_ID  = os.getenv("AIRFLOW_DAG_ID", "query_runner")
+AIRFLOW_USER    = os.getenv("AIRFLOW_API_USERNAME", "admin")
+AIRFLOW_PASS    = os.getenv("AIRFLOW_API_PASSWORD", "admin")
+AIRFLOW_TOKEN   = os.getenv("AIRFLOW_API_TOKEN", "").strip()  # optionnel (pré-provisionné)
+AIRFLOW_TOKEN_URL = os.getenv("AIRFLOW_TOKEN_URL", f"{AIRFLOW_BASE}/auth/token")
 
-def create_consumer() -> KafkaConsumer:
-    return KafkaConsumer(
+_session = requests.Session()
+_bearer: Optional[str] = AIRFLOW_TOKEN or None
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _get_token(force: bool = False) -> str:
+    global _bearer
+    if _bearer and not force:
+        return _bearer
+    # password grant style
+    payload = {"username": AIRFLOW_USER, "password": AIRFLOW_PASS}
+    r = _session.post(AIRFLOW_TOKEN_URL, json=payload, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    _bearer = data.get("access_token")
+    if not _bearer:
+        raise RuntimeError("No access_token in /auth/token response")
+    log.info("Obtained Airflow API token")
+    return _bearer
+
+def _post_v2_with_bearer(conf: Dict[str, Any], retry_on_401: bool = True) -> str:
+    url = f"{AIRFLOW_BASE}/api/v2/dags/{AIRFLOW_DAG_ID}/dagRuns"
+    payload = {"logical_date": _now_iso(), "conf": conf}
+    token = _get_token(force=False)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    r = _session.post(url, json=payload, headers=headers, timeout=20)
+    if r.status_code == 401 and retry_on_401:
+        log.warning("401 from Airflow API, refreshing token…")
+        _get_token(force=True)
+        return _post_v2_with_bearer(conf, retry_on_401=False)
+    r.raise_for_status()
+    return r.json().get("dag_run_id", "unknown")
+
+def main():
+    log.info("Starting DAG launcher (Kafka->Airflow v2, Bearer token)…")
+    consumer = KafkaConsumer(
         TOPIC_Q_REQ,
         bootstrap_servers=[KAFKA_BROKER],
-        group_id="query-runner",
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),
+        auto_offset_reset="latest",
         enable_auto_commit=True,
-        auto_offset_reset="earliest",
-        consumer_timeout_ms=0,
+        consumer_timeout_ms=30000,
+        group_id="query-runner",
     )
-
-
-def create_producer() -> KafkaProducer:
-    return KafkaProducer(
+    producer = KafkaProducer(
         bootstrap_servers=[KAFKA_BROKER],
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        linger_ms=50,
-        acks=1,
-        retries=3,
+        linger_ms=20, acks=1,
     )
 
-
-def submit_spark(request: Dict[str, Any]) -> Dict[str, Any]:
-    request_id = request["request_id"]
-    query = request.get("query", {})
-    city_ids = ",".join(query.get("city_ids", []))
-    date_from = query.get("date_from")
-    date_to = query.get("date_to")
-    metrics = ",".join(query.get("metrics", ["temperature_2m"]))
-    agg = query.get("agg") or "avg"
-
-    cmd = [
-        "spark-submit",
-        "--master", SPARK_MASTER,
-        "--conf", "spark.jars.ivy=/tmp/.ivy2",
-        "--conf", "spark.hadoop.fs.defaultFS=hdfs://namenode:8020",
-        "--conf", "spark.hadoop.hadoop.security.authentication=simple",
-        "--conf", "spark.driver.extraJavaOptions=-Duser.name=root",
-        "--conf", "spark.executor.extraJavaOptions=-Duser.name=root",
-        SPARK_SCRIPT,
-        "--request_id", request_id,
-        "--city_ids", city_ids,
-        "--date_from", date_from or "",
-        "--date_to", date_to or "",
-        "--metrics", metrics,
-        "--agg", agg,
-    ]
-
-    env = os.environ.copy()
-    env["USER"] = "root"
-    env["HADOOP_USER_NAME"] = "root"
-    logger.info("Submitting Spark job: %s", " ".join(cmd))
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, text=True)
-    stdout_lines = []
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        stdout_lines.append(line.rstrip())
-        # Try to parse JSON status if present
-        try:
-            if line.lstrip().startswith("{"):
-                obj = json.loads(line)
-                if obj.get("request_id") == request_id:
-                    status = obj
-        except Exception:
-            pass
-        sys.stdout.write(line)
-        sys.stdout.flush()
-    code = proc.wait()
-
-    # Fallback status if not parsed
-    status_obj: Dict[str, Any] = {
-        "request_id": request_id,
-        "status": "done" if code == 0 else "failed",
-        "result_path": f"{HDFS_BASE}/gold/queries/{request_id}",
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "exit_code": code,
-        "logs_tail": stdout_lines[-20:],
-    }
-
-    # If spark printed a JSON status, prefer it
+    # warm-up token (optional)
     try:
-        if 'status' in locals() and isinstance(status, dict):
-            status_obj.update(status)
-    except Exception:
-        pass
+        _get_token(force=not bool(AIRFLOW_TOKEN))
+    except Exception as e:
+        log.warning("Token warm-up skipped: %s", e)
 
-    return status_obj
-
-
-def main() -> None:
-    logger.info("Starting query_runner. broker=%s req_topic=%s res_topic=%s", KAFKA_BROKER, TOPIC_Q_REQ, TOPIC_Q_RES)
-    consumer = create_consumer()
-    producer = create_producer()
-
-    for msg in consumer:
+    while True:
         try:
-            payload = msg.value
-            request_id = payload.get("request_id")
-            logger.info("Received request_id=%s", request_id)
-            result = submit_spark(payload)
-            logger.info("Publishing result for request_id=%s", request_id)
-            producer.send(TOPIC_Q_RES, value=result)
-            producer.flush()
-        except Exception as exc:
-            logger.exception("Failed processing message: %s", exc)
-
+            for msg in consumer:
+                conf = msg.value or {}
+                rid = conf.get("request_id")
+                try:
+                    dag_run_id = _post_v2_with_bearer(conf)
+                    log.info("Triggered DAG: %s (request_id=%s)", dag_run_id, rid)
+                    producer.send(TOPIC_Q_RES, value={
+                        "request_id": rid, "status": "submitted",
+                        "dag_run_id": dag_run_id, "ts": time.time()
+                    })
+                    producer.flush()
+                except Exception as e:
+                    log.exception("Failed to trigger DAG")
+                    producer.send(TOPIC_Q_RES, value={
+                        "request_id": rid, "status": "error",
+                        "error": str(e), "ts": time.time()
+                    })
+                    producer.flush()
+        except Exception as e:
+            log.exception("Fatal loop error; retry in 3s")
+            time.sleep(3)
 
 if __name__ == "__main__":
-    main() 
+    main()

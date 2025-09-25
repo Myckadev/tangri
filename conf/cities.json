@@ -1,7 +1,7 @@
 {
-  "version": 1,
-  "updated_at": "2025-09-24T12:00:00Z",
-  "updated_by": "bootstrap",
+  "version": 5,
+  "updated_at": "2025-09-25T12:26:15Z",
+  "updated_by": "streamlit",
   "cities": [
     {
       "id": "paris-fr",
@@ -17,6 +17,22 @@
       "country": "FR",
       "lat": 45.764,
       "lon": 4.8357,
+      "active": true
+    },
+    {
+      "id": "marseille-fr",
+      "name": "Marseille",
+      "country": "FR",
+      "lat": 43.2965,
+      "lon": 5.3698,
+      "active": true
+    },
+    {
+      "id": "nanterre-fr",
+      "name": "Nanterre",
+      "country": "FR",
+      "lat": 48.89198,
+      "lon": 2.20675,
       "active": true
     }
   ]

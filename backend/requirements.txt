@@ -4,3 +4,4 @@ kafka-python==2.0.2
 pydantic==2.8.2
 prometheus-client
 python-dateutil
+httpx[http2]

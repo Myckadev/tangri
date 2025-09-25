@@ -32,6 +32,11 @@ services:
     image: bitnami/kafka:3.7
     <<: *env
     depends_on: [zookeeper]
+    healthcheck:
+      test: [ "CMD-SHELL", "kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     environment:
       - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
       - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092
@@ -60,7 +65,9 @@ services:
     image: danielqsj/kafka-exporter:latest
     <<: *env
     command: ["--kafka.server=kafka:9092", "--zookeeper.server=zookeeper:2181"]
-    depends_on: [kafka]
+    depends_on:
+      kafka:
+        condition: service_healthy
     ports:
       - "9308:9308"
     networks: [lambda-net]
@@ -71,7 +78,7 @@ services:
     environment:
       - CLUSTER_NAME=lambda
     ports:
-      - "9870:9870"   # HDFS NameNode UI
+      - "9870:9870"   # HDFS NameNode UI (sert aussi pour WebHDFS)
     volumes:
       - hdfs-nn:/hadoop/dfs/name
     networks: [lambda-net]
@@ -91,7 +98,7 @@ services:
   spark-master:
     image: bitnami/spark:3.5
     <<: *env
-    user: "0:0"                        # utilisateur Unix valide (root)
+    user: "0:0"
     environment:
       - SPARK_MODE=master
       - HOME=/opt/spark
@@ -120,7 +127,7 @@ services:
       - ./spark:/opt/spark_jobs
     networks: [lambda-net]
 
-  # ---------- Airflow (mix "officiel" + stack globale) ----------
+  # ---------- Airflow + Postgres ----------
   postgres:
     image: postgres:15-alpine
     <<: *env
@@ -146,8 +153,9 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-      AIRFLOW__CORE__STORE_SERIALIZED_DAGS: "True"          # <- important
+      AIRFLOW__CORE__STORE_SERIALIZED_DAGS: "True"
       AIRFLOW__CORE__MIN_SERIALIZED_DAG_UPDATE_INTERVAL: "5"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth   # << enable API auth
     depends_on:
       - postgres
     volumes:
@@ -173,13 +181,25 @@ services:
     env_file: [.env]
     user: "${AIRFLOW_UID:-50000}:0"
     environment:
+      # --- Core / DB ---
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-      AIRFLOW__CORE__STORE_SERIALIZED_DAGS: "True"          # <- important
+      AIRFLOW__CORE__STORE_SERIALIZED_DAGS: "True"
       AIRFLOW__CORE__MIN_SERIALIZED_DAG_UPDATE_INTERVAL: "5"
+      AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: "120"
+      # --- Logging (clé pour voir les logs dans l’UI) ---
+      AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
+      AIRFLOW__LOGGING__REMOTE_LOGGING: "False"
+      AIRFLOW__LOGGING__TASK_LOG_READER: task
+      AIRFLOW__LOGGING__LOGGING_LEVEL: DEBUG
+      AIRFLOW__LOGGING__FAB_LOGGING_LEVEL: DEBUG
+      # --- UI / Divers ---
+      AIRFLOW__WEBSERVER__EXPOSE_STACKTRACE: "True"
+      # --- Tes env Spark ---
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_QUERY_SCRIPT: /opt/spark_jobs/run_query.py
     depends_on:
       postgres:
         condition: service_started
@@ -211,13 +231,28 @@ services:
     env_file: [.env]
     user: "${AIRFLOW_UID:-50000}:0"
     environment:
+      # --- Core / DB ---
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-      AIRFLOW__CORE__STORE_SERIALIZED_DAGS: "True"          # <- important
+      AIRFLOW__CORE__STORE_SERIALIZED_DAGS: "True"
       AIRFLOW__CORE__MIN_SERIALIZED_DAG_UPDATE_INTERVAL: "5"
+      AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: "120"
+      # --- Logging (identique au webserver) ---
+      AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
+      AIRFLOW__LOGGING__REMOTE_LOGGING: "False"
+      AIRFLOW__LOGGING__TASK_LOG_READER: task
+      AIRFLOW__LOGGING__LOGGING_LEVEL: DEBUG
+      AIRFLOW__LOGGING__FAB_LOGGING_LEVEL: DEBUG
+      # --- API auth si tu pilotes via l’API ---
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+      # --- Tes env Spark ---
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_QUERY_SCRIPT: /opt/spark_jobs/run_query.py
+      # (optionnel mais pratique)
+      AIRFLOW__WEBSERVER__EXPOSE_STACKTRACE: "True"
     depends_on:
       airflow-webserver:
         condition: service_healthy
@@ -240,6 +275,7 @@ services:
     env_file: [ .env ]
     user: "${AIRFLOW_UID:-50000}:0"
     environment:
+      # --- Core / DB ---
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
@@ -247,21 +283,35 @@ services:
       AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
       AIRFLOW__CORE__STORE_SERIALIZED_DAGS: "True"
       AIRFLOW__CORE__MIN_SERIALIZED_DAG_UPDATE_INTERVAL: "5"
+      AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: "120"
+      # --- Logging (identique) ---
+      AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
+      AIRFLOW__LOGGING__REMOTE_LOGGING: "False"
+      AIRFLOW__LOGGING__TASK_LOG_READER: task
+      AIRFLOW__LOGGING__LOGGING_LEVEL: DEBUG
+      AIRFLOW__LOGGING__FAB_LOGGING_LEVEL: DEBUG
+      # --- API auth si besoin ---
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+      # --- Tes env Spark ---
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_QUERY_SCRIPT: /opt/spark_jobs/run_query.py
+      AIRFLOW__WEBSERVER__EXPOSE_STACKTRACE: "True"
     depends_on:
       airflow-webserver:
         condition: service_healthy
     command: [ "bash","-lc","exec airflow dag-processor" ]
     volumes:
-      - ./airflow/dags:/opt/airflow/dags
+      - airflow-dags:/opt/airflow/dags
       - airflow-logs:/opt/airflow/logs
       - airflow-plugins:/opt/airflow/plugins
+      - ./airflow/dags:/opt/airflow/dags
       - ./spark:/opt/spark_jobs
       - ./conf:/opt/conf
     networks: [ lambda-net ]
 
+
   # ---------------------------------------------------------------
 
-  # Backend FastAPI — endpoints /config (villes), /query (requêtes batch)
   backend:
     build: ./backend
     image: openmeteo-backend:latest
@@ -270,6 +320,7 @@ services:
       - KAFKA_BROKER=${KAFKA_BROKER:-kafka:9092}
       - TOPIC_Q_REQ=${TOPIC_Q_REQ:-weather.queries.requests}
       - TOPIC_Q_RES=${TOPIC_Q_RES:-weather.queries.results}
+      - TOPIC_HOURLY=${TOPIC_HOURLY:-weather.hourly.flattened}     # << pour métriques temps réel Grafana
     volumes:
       - ./conf:/app/conf
       - ./backend:/app
@@ -278,7 +329,6 @@ services:
       - "8000:8000"
     networks: [lambda-net]
 
-  # Producteur Open-Meteo (API → Kafka RAW)
   producer:
     build: ./producer
     image: openmeteo-producer:latest
@@ -289,11 +339,10 @@ services:
       - CITIES_FILE=/app/conf/cities.json
     volumes:
       - ./conf:/app/conf
-    depends_on: [kafka]
+    depends_on: [kafka, backend]
     restart: unless-stopped
     networks: [lambda-net]
 
-  # Streamlit — Frontend 2 (config villes + requêtes batch)
   streamlit:
     build: ./streamlit
     image: openmeteo-streamlit:latest
@@ -301,6 +350,8 @@ services:
     depends_on: [backend]
     environment:
       - BACKEND_URL=http://backend:8000
+      - PRODUCER_URL=http://producer:8000
+      - WEBHDFS_URL=http://namenode:9870/webhdfs/v1
     ports:
       - "8501:8501"
     networks: [lambda-net]
@@ -313,20 +364,20 @@ services:
       - KAFKA_BROKER=${KAFKA_BROKER:-kafka:9092}
       - TOPIC_Q_REQ=${TOPIC_Q_REQ:-weather.queries.requests}
       - TOPIC_Q_RES=${TOPIC_Q_RES:-weather.queries.results}
-      - SPARK_MASTER=spark://spark-master:7077
-      - HDFS_BASE=hdfs://namenode:8020/datalake
-      - SPARK_SCRIPT=/opt/spark_jobs/run_query.py
-      - USER=root
-      - HADOOP_USER_NAME=root
-    volumes:
-      - ./spark:/opt/spark_jobs
+      - AIRFLOW_API_URL=http://airflow-webserver:8080/api/v2
+      - AIRFLOW_API_USERNAME=admin
+      - AIRFLOW_API_PASSWORD=admin
+      - AIRFLOW_DAG_ID=query_runner
+      - AIRFLOW_BASE_URL=http://airflow-webserver:8080     # ou 8088 côté host, mais ici on parle réseau docker
+      - AIRFLOW_TOKEN_URL=http://airflow-webserver:8080/auth/token
     depends_on:
-      - spark-master
-      - kafka
+      kafka:
+        condition: service_healthy
+      airflow-webserver:
+        condition: service_healthy
     restart: unless-stopped
     networks: [lambda-net]
 
-  # Prometheus + exporters
   prometheus:
     image: prom/prometheus:v2.53.0
     <<: *env
